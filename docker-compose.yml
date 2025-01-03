@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  llm-api:
+    build: .
+    ports:
+      - "8080:8080"
+      - "11434:11434"
+    env_file:
+      - .env
+    volumes:
+      - ollama-models:/root/.ollama
+
+volumes:
+  ollama-models:
