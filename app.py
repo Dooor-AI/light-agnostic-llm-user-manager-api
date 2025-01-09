@@ -11,9 +11,16 @@ import json
 from threading import Lock
 import fcntl
 from flask_cors import CORS
+from werkzeug.utils import secure_filename  # para salvar arquivos com nome seguro
 
 CREDITS_FILE = os.environ.get('CREDITS_FILE', '/data/user_credits.json')
 credits_lock = Lock()
+
+# --- MODELS FEATURE ---
+MODELS_FILE = os.environ.get('MODELS_FILE', '/data/models.json')
+MODELS_FOLDER = os.environ.get('MODELS_FOLDER', '/data/models/')
+models_lock = Lock()
+models_metadata = {}
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -50,12 +57,23 @@ def initialize_credits_file():
         logger.error(f"Error initializing credits file: {str(e)}")
         raise
 
-def init_app():
-    """Initialize the application"""
-    logger.info(f"Initializing application with credits file: {CREDITS_FILE}")
-    initialize_credits_file()
-    load_credits()
-    logger.info("Application initialized")
+# --- MODELS FEATURE ---
+def initialize_models_file():
+    """Ensure models file exists and is properly initialized"""
+    try:
+        os.makedirs(os.path.dirname(MODELS_FILE), exist_ok=True)
+        os.makedirs(MODELS_FOLDER, exist_ok=True)
+
+        if not os.path.exists(MODELS_FILE):
+            with open(MODELS_FILE, 'w') as f:
+                json.dump({}, f)
+            logger.info(f"Created new models file at {MODELS_FILE}")
+        
+        # Permissão para escrita
+        os.chmod(MODELS_FILE, 0o666)
+    except Exception as e:
+        logger.error(f"Error initializing models file: {str(e)}")
+        raise
 
 def load_credits():
     """Load credits from file"""
@@ -72,19 +90,21 @@ def load_credits():
         logger.error(f"Error loading credits: {str(e)}")
         user_credits = {}
 
-def get_current_credits(address):
-    """Get current credits from file"""
+# --- MODELS FEATURE ---
+def load_models_metadata():
+    """Load models metadata from file"""
+    global models_metadata
     try:
-        with open(CREDITS_FILE, 'r') as f:
+        with open(MODELS_FILE, 'r') as f:
             fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             try:
-                credits = json.load(f)
-                return credits.get(address)
+                models_metadata = json.load(f)
+                logger.info(f"Loaded models metadata: {models_metadata}")
             finally:
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except Exception as e:
-        logger.error(f"Error reading credits: {str(e)}")
-        return None
+        logger.error(f"Error loading models metadata: {str(e)}")
+        models_metadata = {}
 
 def save_credits():
     """Save credits to file"""
@@ -103,6 +123,39 @@ def save_credits():
                 fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except Exception as e:
         logger.error(f"Error saving credits: {str(e)}")
+
+# --- MODELS FEATURE ---
+def save_models_metadata():
+    """Save models metadata to file"""
+    try:
+        with open(MODELS_FILE, 'r+') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            try:
+                current_models = json.load(f)
+                current_models.update(models_metadata)
+                f.seek(0)
+                f.truncate()
+                json.dump(current_models, f)
+                logger.info("Models metadata saved to file")
+                models_metadata.update(current_models)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        logger.error(f"Error saving models metadata: {str(e)}")
+
+def get_current_credits(address):
+    """Get current credits from file"""
+    try:
+        with open(CREDITS_FILE, 'r') as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
+            try:
+                credits = json.load(f)
+                return credits.get(address)
+            finally:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    except Exception as e:
+        logger.error(f"Error reading credits: {str(e)}")
+        return None
 
 def validate_timestamp(timestamp_str):
     """Validates if the timestamp is within the allowed period"""
@@ -359,6 +412,168 @@ def admin_get_user_credits(address):
         "usage_percentage": (user["used"] / user["credits"] * 100) if user["credits"] > 0 else 0
     })
 
+# --- MODELS FEATURE ---
+@app.route('/models', methods=['POST'])
+@require_auth
+def upload_model():
+    """
+    Endpoint para upload de um novo modelo.
+    Espera um form-data (multipart) com, por exemplo:
+      - model_file: (arquivo .gguf ou similar)
+      - model_name: string
+      - visibility: 'public' ou 'whitelisted'
+      - allowed_addresses: lista de endereços (opcional)
+    """
+    admin_key = request.headers.get('Authorization')
+    address = None
+
+    # Identifica o address (caso não seja admin)
+    if admin_key and admin_key == f"Bearer {API_KEY}":
+        # Admin pode efetuar upload em nome dele mesmo ou “em nome do sistema”
+        address = "ADMIN"
+    else:
+        address = get_current_user()
+        if not address:
+            return jsonify({"error": "User not identified"}), 401
+
+    # Verifica se veio o arquivo
+    if 'model_file' not in request.files:
+        return jsonify({"error": "No model_file provided"}), 400
+
+    file = request.files['model_file']
+
+    # Metadados
+    model_name = request.form.get('model_name', '').strip()
+    visibility = request.form.get('visibility', 'public').lower()
+    allowed_addresses_str = request.form.get('allowed_addresses', '')
+
+    # Valida campos
+    if not model_name:
+        return jsonify({"error": "model_name is required"}), 400
+
+    if visibility not in ['public', 'whitelisted']:
+        return jsonify({"error": "visibility must be public or whitelisted"}), 400
+
+    # Caso o usuário queira whitelisted mas não passou allowed_addresses, vira lista vazia
+    allowed_addresses = []
+    if allowed_addresses_str:
+        try:
+            # Exemplo: "0xabc, 0xdef, 0xghi"
+            allowed_addresses = [x.strip() for x in allowed_addresses_str.split(',')]
+        except:
+            allowed_addresses = []
+
+    # Garante nome único (simples, mas você pode querer algo mais robusto)
+    if model_name in models_metadata:
+        return jsonify({"error": f"Model '{model_name}' already exists"}), 400
+
+    filename = secure_filename(file.filename)
+    extension = os.path.splitext(filename)[1]  # e.g. .gguf
+    if not extension:
+        extension = ".gguf"  # Default
+
+    save_path = os.path.join(MODELS_FOLDER, f"{model_name}{extension}")
+
+    try:
+        file.save(save_path)
+    except Exception as e:
+        logger.error(f"Error saving model file: {str(e)}")
+        return jsonify({"error": "Failed to save model file"}), 500
+
+    # Atualiza metadados
+    with models_lock:
+        models_metadata[model_name] = {
+            "owner": address,
+            "visibility": visibility,
+            "allowed_addresses": allowed_addresses,
+            "file_path": save_path
+        }
+        save_models_metadata()
+
+    return jsonify({
+        "message": f"Model '{model_name}' uploaded successfully",
+        "model_name": model_name,
+        "owner": address,
+        "visibility": visibility,
+        "allowed_addresses": allowed_addresses
+    })
+
+# --- MODELS FEATURE ---
+@app.route('/models', methods=['GET'])
+@require_auth
+def list_models():
+    """
+    Lists available models:
+      - If admin, lists all models
+      - If a regular user, lists:
+          -> public models
+          -> models where the user is the owner
+          -> whitelisted models where the user is in allowed_addresses
+    """
+    admin_key = request.headers.get('Authorization')
+    is_admin = (admin_key and admin_key == f"Bearer {API_KEY}")
+    current_address = get_current_user() if not is_admin else "ADMIN"
+
+    results = []
+    with models_lock:
+        for model_name, meta in models_metadata.items():
+            # If admin, list all models
+            if is_admin:
+                results.append({
+                    "model_name": model_name,
+                    **meta
+                })
+            else:
+                # If the model is public
+                if meta["visibility"] == "public":
+                    results.append({"model_name": model_name, **meta})
+                # Or if the user is the owner of the model
+                elif meta["owner"] == current_address:
+                    results.append({"model_name": model_name, **meta})
+                # Or if it is whitelisted and the current_address is in the allowed list
+                elif meta["visibility"] == "whitelisted" and current_address in meta["allowed_addresses"]:
+                    results.append({"model_name": model_name, **meta})
+
+    return jsonify(results)
+
+# --- MODELS FEATURE ---
+@app.route('/models/<model_name>', methods=['DELETE'])
+@require_auth
+def delete_model(model_name):
+    """
+    Deletes a model if:
+      - The user is admin, or
+      - The user is the owner of the model
+    Removes the model file from disk and updates the metadata.
+    """
+    admin_key = request.headers.get('Authorization')
+    is_admin = (admin_key and admin_key == f"Bearer {API_KEY}")
+    current_address = get_current_user() if not is_admin else "ADMIN"
+
+    with models_lock:
+        if model_name not in models_metadata:
+            return jsonify({"error": "Model not found"}), 404
+
+        meta = models_metadata[model_name]
+        owner = meta["owner"]
+
+        # Only delete if admin or owner
+        if not is_admin and current_address != owner:
+            return jsonify({"error": "Not authorized to delete this model"}), 403
+
+        file_path = meta["file_path"]
+        # Remove the file
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except Exception as e:
+            logger.error(f"Error deleting model file: {str(e)}")
+
+        del models_metadata[model_name]
+        save_models_metadata()
+
+    return jsonify({"message": f"Model '{model_name}' deleted successfully"})
+
 @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE'])
 @require_auth
 def proxy(path):
@@ -409,6 +624,18 @@ def proxy(path):
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({"status": "healthy"})
+
+def init_app():
+    """Initialize the application"""
+    logger.info(f"Initializing application with credits file: {CREDITS_FILE}")
+    initialize_credits_file()
+    load_credits()
+    
+    logger.info(f"Initializing application with models file: {MODELS_FILE}")
+    initialize_models_file()
+    load_models_metadata()
+
+    logger.info("Application initialized")
 
 if __name__ == '__main__':
     init_app()
